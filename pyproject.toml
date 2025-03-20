@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trend_getter"
+version = "0.1.0"
+description = ""
+authors = [{name = "Brad Ochocki Szasz", email = "bochocki@mozilla.com"}]
+dependencies = [
+    "numpy",
+    "pandas",
+    "plotly",
+    "prophet",
+    "sqlglot",
+    "scipy",
+    "python-dateutil"
+]
