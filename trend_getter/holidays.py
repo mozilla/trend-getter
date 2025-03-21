@@ -3,9 +3,16 @@ import numpy as np
 import pandas as pd
 
 from collections import defaultdict
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from dateutil.easter import easter
 from typing import Optional
+
+from trend_getter.plotting import Line, plot
+from trend_getter.metric_calculations import moving_average, year_over_year
+
+
+NO_PASCHAL_CYCLE = ["IN", "JP", "IR", "CN"]
 
 
 class PaschalCycleHolidays(holidays.HolidayBase):
@@ -53,7 +60,7 @@ class MozillaHolidays(holidays.HolidayBase):
 def get_calendar(
     country: str,
     holiday_years: list,
-    include_paschal_cycle: bool = False,
+    exclude_paschal_cycle: list = NO_PASCHAL_CYCLE,
     split_concurrent_holidays: bool = False,
 ) -> pd.DataFrame:
     """
@@ -62,7 +69,7 @@ def get_calendar(
     Args:
         country (str): Country code (e.g., "US", "FR", "ROW").
         holiday_years (list): List of years to include holidays from.
-        include_paschal_cycle (bool): Whether to include holidays like Easter and related observances.
+        include_paschal_cycle (list): A list of countries that aren't impacted by the Paschal Cycle.
         split_concurrent_holidays (bool): Whether to split semicolon-delimited holidays into multiple rows.
 
     Returns:
@@ -76,7 +83,7 @@ def get_calendar(
         country_holidays = getattr(holidays, country)(years=holiday_years)
 
     # Optionally add Paschal cycle holidays
-    if include_paschal_cycle:
+    if country not in exclude_paschal_cycle:
         country_holidays += PaschalCycleHolidays(years=holiday_years)
 
     # Include Mozilla-specific holidays for 2019
@@ -313,6 +320,7 @@ def estimate_impacts(
                 holiday_impacts[row.holiday][row.date_diff]["years"].add(
                     row.submission_date_holiday.year
                 )
+    print()
 
     # Compute average impact for each (holiday, date_diff) pair
     for diffs in holiday_impacts.values():
@@ -323,3 +331,195 @@ def estimate_impacts(
                 data["average_impact"] = 0.0  # Prevent division by zero
 
     return holiday_impacts
+
+
+def predict_impacts(countries, holiday_impacts, start_date, end_date):
+
+    future_dates = pd.date_range(start_date, end_date)
+
+    holiday_dates = (
+        pd.concat(
+            get_calendar(
+                country=country,
+                holiday_years=np.unique(future_dates.year),
+                split_concurrent_holidays=True,
+            )
+            for country in countries
+        )
+        .sort_values(by="submission_date")
+        .reset_index(drop=True)
+    )
+
+    impacts = []  # List to store predicted impact values
+    new_holidays = set()  # Track unknown holidays for diagnostic output
+
+    for target_date in future_dates:
+        # Compute date difference between target_date and all holiday dates
+        date_diffs = pd.to_datetime(target_date) - holiday_dates.submission_date
+
+        # Filter holidays within ±7 days
+        nearby = holiday_dates[abs(date_diffs) <= timedelta(days=7)].copy()
+
+        impact = 0
+
+        if len(nearby) and not nearby["holiday"].str.contains("Data Loss").any():
+            # Compute integer date_diff for indexing
+            nearby["date_diff"] = date_diffs[nearby.index].map(lambda x: x.days)
+
+            # Accumulate known holiday impacts
+            for row in nearby.itertuples():
+                if row.holiday in holiday_impacts:
+                    impact += holiday_impacts[row.holiday][row.date_diff][
+                        "average_impact"
+                    ]
+                else:
+                    new_holidays.add(row.holiday)
+
+        impacts.append(impact)
+
+    print("Unaccounted Holidays:\n - " + "\n - ".join(new_holidays))
+    return pd.DataFrame({"submission_date": future_dates, "impact": impacts})
+
+
+@dataclass
+class HolidayImpacts:
+    df: pd.DataFrame
+    forecast_start: str
+    forecast_end: str
+    detrend_threshold: float = -0.05
+    detrend_max_radius: int = 5
+    detrend_min_radius: int = 3
+    detrend_spike_correction: Optional[float] = None
+    calendar_exclude_paschal_cycle: list = field(
+        default_factory=lambda: NO_PASCHAL_CYCLE
+    )
+
+    def __post_init__(self):
+        self.countries = np.unique(self.df.country)
+        self.observed_years = pd.to_datetime(self.df.submission_date).dt.year.unique()
+
+        self.dau_dfs = {}
+        self.holiday_dfs = {}
+
+    def fit(self):
+        for country in self.countries:
+            self.holiday_dfs[country] = get_calendar(
+                country=country,
+                holiday_years=self.observed_years,
+                exclude_paschal_cycle=self.calendar_exclude_paschal_cycle,
+                split_concurrent_holidays=False,
+            )
+
+            self.dau_dfs[country] = detrend(
+                df=self.df[self.df.country == country],
+                holiday_df=self.holiday_dfs[country],
+                threshold=self.detrend_threshold,
+                max_radius=self.detrend_max_radius,
+                min_radius=self.detrend_min_radius,
+                spike_correction=self.detrend_spike_correction,
+            )
+
+            self.dau_dfs[country]["dau_28ma"] = moving_average(
+                self.dau_dfs[country]["dau"]
+            )
+            self.dau_dfs[country]["edau_28ma"] = moving_average(
+                self.dau_dfs[country]["expected"]
+            )
+
+            self.dau_dfs[country]["dau_yoy"] = year_over_year(
+                self.dau_dfs[country], "dau_28ma"
+            )
+            self.dau_dfs[country]["edau_yoy"] = year_over_year(
+                self.dau_dfs[country], "edau_28ma"
+            )
+
+        self.holiday_impacts = estimate_impacts(
+            dau_dfs=self.dau_dfs,
+            holiday_dfs=self.holiday_dfs,
+            last_observed_date=self.forecast_start,
+        )
+
+        self.future_impacts = None
+
+    def predict(self):
+
+        if self.future_impacts is None:
+            self.future_impacts = predict_impacts(
+                self.countries,
+                self.holiday_impacts,
+                self.forecast_start,
+                self.forecast_end,
+            )
+
+        return self.future_impacts
+
+    def plot_countries(self):
+        for country, df in self.dau_dfs.items():
+            plot(
+                df,
+                [
+                    Line("dau", "#ff9900", "DAU"),
+                    Line("expected", "black", "Detrended DAU", opacity=0.5),
+                ],
+                f"Holiday Detrended DAU ({country})",
+                "DAU",
+            )
+            plot(
+                df,
+                [
+                    Line("dau_28ma", "#ff9900", "DAU 28MA"),
+                    Line("edau_28ma", "black", "Detrended DAU 28MA", opacity=0.5),
+                ],
+                f"Holiday Detrended DAU 28MA ({country})",
+                "DAU 28MA",
+            )
+            plot(
+                df,
+                [
+                    Line("dau_yoy", "#ff9900", "DAU YoY"),
+                    Line("edau_yoy", "black", "Detrended DAU YoY", opacity=0.5),
+                ],
+                f"Holiday Detrended DAU YoY ({country})",
+                "DAU YoY",
+            )
+
+    def plot_overall(self):
+        all_countries = (
+            pd.concat(
+                [
+                    i[["submission_date", "dau", "expected", "dau_28ma", "edau_28ma"]]
+                    for i in self.dau_dfs.values()
+                ]
+            )
+            .groupby("submission_date", as_index=False)
+            .sum(min_count=1)
+        )
+        all_countries["dau_yoy"] = year_over_year(all_countries, "dau_28ma")
+        all_countries["edau_yoy"] = year_over_year(all_countries, "edau_28ma")
+
+        plot(
+            all_countries,
+            [
+                Line("dau_28ma", "#ff9900", "DAU 28MA"),
+                Line("edau_28ma", "black", "Detrended DAU 28MA", opacity=0.5),
+            ],
+            "Holiday Detrended DAU 28MA",
+            "DAU 28MA",
+        )
+        plot(
+            all_countries,
+            [
+                Line("dau_yoy", "#ff9900", "DAU 28MA YoY"),
+                Line("edau_yoy", "black", "Holidays Removed YoY", opacity=0.5),
+            ],
+            "YoY Dashboard Comparisons",
+            "DAU YoY",
+        )
+
+    def plot_future_impacts(self):
+        plot(
+            self.predict(),
+            [Line("impact", "black", "DAU Impact")],
+            "Estimated Holiday Impacts",
+            "Estimated DAU",
+        )
