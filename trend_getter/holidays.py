@@ -220,53 +220,61 @@ def detrend(
 
 
 def estimate_impacts(
-    dau_dfs,
-    holiday_dfs,
+    dau_dfs: dict,
+    holiday_dfs: dict,
     last_observed_date=None,
-    dau_column="dau",
-    expected_dau_column="expected",
-):
+    dau_column: str = "dau",
+    expected_dau_column: str = "expected",
+) -> dict:
+    """
+    Estimate holiday impacts by comparing observed and expected DAU near holidays.
 
-    # Initialize nested dictionary
+    Parameters:
+        dau_dfs (dict): Dictionary of DataFrames with actual and expected DAU per country.
+        holiday_dfs (dict): Dictionary of DataFrames with holidays per country.
+        last_observed_date (str or pd.Timestamp, optional): Filter out dates >= this value.
+        dau_column (str): Column name for actual DAU.
+        expected_dau_column (str): Column name for expected DAU.
+
+    Returns:
+        dict: Nested dictionary of estimated holiday impacts:
+              {holiday: {date_diff: {"impact": [...], "years": set(), "average_impact": float}}}
+    """
     holiday_impacts = defaultdict(
         lambda: defaultdict(lambda: {"impact": [], "years": set()})
     )
 
     print("Calculating holiday impacts for: ", end="")
 
-    for country in dau_dfs.keys():
+    for country in dau_dfs:
         print(country, end=", ")
 
-        dau_df = dau_dfs[country]
-        holiday_df = holiday_dfs[country]
+        dau_df = dau_dfs[country].copy()
+        holiday_df = holiday_dfs[country].copy()
 
+        # Optional filter to exclude future dates
         if last_observed_date is not None:
-            # Filter only relevant years
             dau_df = dau_df[
                 dau_df["submission_date"] < pd.to_datetime(last_observed_date)
             ].copy()
 
-        # Merge DAU with holidays to create a single DataFrame with all relevant dates
-        merged_df = dau_df.merge(
-            holiday_df, how="cross", suffixes=("_dau", "_holiday")
-        ).copy()
+        # Cross-join DAU and holiday dates
+        merged_df = dau_df.merge(holiday_df, how="cross", suffixes=("_dau", "_holiday"))
 
-        # Compute date difference once for all rows
+        # Calculate date difference between submission_dates and holiday dates
         merged_df["date_diff"] = (
             merged_df["submission_date_dau"] - merged_df["submission_date_holiday"]
         ).dt.days
 
-        # Keep only holiday events within the ±7-day window
-        merged_df = merged_df[
-            (merged_df["date_diff"] >= -7) & (merged_df["date_diff"] <= 7)
-        ].copy()
+        # Keep only rows where a holiday is within ±7 days of the date
+        merged_df = merged_df[merged_df["date_diff"].between(-7, 7)].copy()
 
-        # Remove rows with "Data Loss" holidays
+        # Exclude rows with "Data Loss" holidays
         merged_df = merged_df[
             ~merged_df["holiday_holiday"].str.contains("Data Loss", na=False)
         ].copy()
 
-        # Compute impact
+        # Calculate the DAU impact: (observed - expected)
         merged_df["impact"] = merged_df.groupby("submission_date_dau")[
             dau_column
         ].transform("first") - merged_df.groupby("submission_date_dau")[
@@ -275,16 +283,16 @@ def estimate_impacts(
             "first"
         )
 
-        # Compute weights
-        merged_df["weight"] = 1 / (1 + abs(merged_df["date_diff"]))
+        # Apply inverse-distance weighting by date offset
+        merged_df["weight"] = 1 / (1 + merged_df["date_diff"].abs())
         merged_df["scale"] = merged_df["weight"] / merged_df.groupby(
             "submission_date_dau"
         )["weight"].transform("sum")
 
-        # Scale the impact
-        merged_df["impact"] = merged_df["scale"] * merged_df["impact"]
+        # Scale the impact by the weight
+        merged_df["impact"] *= merged_df["scale"]
 
-        # Expand holidays into separate rows
+        # Expand semicolon-delimited holidays into separate rows
         merged_df = (
             merged_df.assign(holiday=merged_df["holiday_dau"].str.split("; "))
             .explode("holiday")
@@ -292,21 +300,26 @@ def estimate_impacts(
             .explode("holiday")
         ).copy()
 
-        # Insert results into holiday_impacts dictionary
-        for i in merged_df.itertuples():
-            holiday_impacts[i.holiday][i.date_diff]["impact"].append(i.impact)
-            if "day off (substituted)" in i.holiday:
-                holiday_impacts[i.holiday][i.date_diff]["years"].add(
-                    i.submission_date_holiday
+        # Aggregate impacts into the nested dictionary
+        for row in merged_df.itertuples():
+            holiday_impacts[row.holiday][row.date_diff]["impact"].append(row.impact)
+
+            # For substituted holidays, store full date; otherwise, store year only
+            if "day off (substituted)" in row.holiday:
+                holiday_impacts[row.holiday][row.date_diff]["years"].add(
+                    row.submission_date_holiday
                 )
             else:
-                holiday_impacts[i.holiday][i.date_diff]["years"].add(
-                    i.submission_date_holiday.year
+                holiday_impacts[row.holiday][row.date_diff]["years"].add(
+                    row.submission_date_holiday.year
                 )
 
-    # Compute the average impact for each holiday at each date offset
-    for _, diffs in holiday_impacts.items():
-        for _, data in diffs.items():
-            data["average_impact"] = sum(data["impact"]) / len(data["years"])
+    # Compute average impact for each (holiday, date_diff) pair
+    for diffs in holiday_impacts.values():
+        for data in diffs.values():
+            if len(data["years"]) > 0:
+                data["average_impact"] = sum(data["impact"]) / len(data["years"])
+            else:
+                data["average_impact"] = 0.0  # Prevent division by zero
 
     return holiday_impacts
