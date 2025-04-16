@@ -433,6 +433,19 @@ class HolidayImpacts:
                 self.dau_dfs[country], "edau_28ma"
             )
 
+        self.all_countries = (
+            pd.concat(
+                [
+                    i[["submission_date", "dau", "expected", "dau_28ma", "edau_28ma"]]
+                    for i in self.dau_dfs.values()
+                ]
+            )
+            .groupby("submission_date", as_index=False)
+            .sum(min_count=1)
+        )
+        self.all_countries["dau_yoy"] = year_over_year(self.all_countries, "dau_28ma")
+        self.all_countries["edau_yoy"] = year_over_year(self.all_countries, "edau_28ma")
+
         self.holiday_impacts = estimate_impacts(
             dau_dfs=self.dau_dfs,
             holiday_dfs=self.holiday_dfs,
@@ -484,21 +497,9 @@ class HolidayImpacts:
             )
 
     def plot_overall(self):
-        all_countries = (
-            pd.concat(
-                [
-                    i[["submission_date", "dau", "expected", "dau_28ma", "edau_28ma"]]
-                    for i in self.dau_dfs.values()
-                ]
-            )
-            .groupby("submission_date", as_index=False)
-            .sum(min_count=1)
-        )
-        all_countries["dau_yoy"] = year_over_year(all_countries, "dau_28ma")
-        all_countries["edau_yoy"] = year_over_year(all_countries, "edau_28ma")
 
         plot(
-            all_countries,
+            self.all_countries,
             [
                 Line("dau_28ma", "#ff9900", "DAU 28MA"),
                 Line("edau_28ma", "black", "Detrended DAU 28MA", opacity=0.5),
@@ -507,7 +508,7 @@ class HolidayImpacts:
             "DAU 28MA",
         )
         plot(
-            all_countries,
+            self.all_countries,
             [
                 Line("dau_yoy", "#ff9900", "DAU 28MA YoY"),
                 Line("edau_yoy", "black", "Holidays Removed YoY", opacity=0.5),
