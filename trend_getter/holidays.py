@@ -125,7 +125,7 @@ def get_calendar(
 def detrend(
     df: pd.DataFrame,
     holiday_df: pd.DataFrame,
-    threshold: float = 0.05,
+    threshold: float = -0.05,
     max_radius: int = 7,
     min_radius: int = 3,
     spike_correction: Optional[float] = None,
@@ -197,7 +197,7 @@ def detrend(
                 a = a_bar
 
             # Compute expected DAU using position + velocity + 0.5 * acceleration
-            e = x + v + 0.5 * a
+            e = (x + v + 0.5 * a) or i.dau
 
             _x.append(x)
             _v.append(v)
