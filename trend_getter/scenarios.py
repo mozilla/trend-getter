@@ -95,13 +95,6 @@ class ScenarioForecasts:
 
     def __post_init__(self) -> None:
         self.scenarios = {i.slug: i for i in self.scenarios}
-        self.dates_to_predict = pd.DataFrame(
-            {
-                "submission_date": pd.date_range(
-                    self.historical_end_date, self.forecast_end_date
-                ).date[1:]
-            }
-        )
 
         self.historical_dfs = {}
         self.historical_forecasts = {}
@@ -109,6 +102,8 @@ class ScenarioForecasts:
         self.scaled_historical_forecasts = {}
         self.scenario_forecasts = {}
         self.scenario_percent_impacts = {}
+
+        self.raw_df = None
 
     def _query_(self) -> None:
         if self.metric == "dau":
@@ -152,14 +147,32 @@ class ScenarioForecasts:
 
         return sqlglot.transpile(query, read="bigquery", pretty=True)[0]
 
-    def fetch_data(self) -> None:
-        query = self._query_()
-        print(f"Fetching Data:\n\n{query}")
+    def fetch_data(self, filtered_end_date: str = None) -> None:
 
-        df = bigquery.Client(project=self.project).query(query).to_dataframe()
+        if self.raw_df is None:
+            query = self._query_()
+            print(f"Fetching Data:\n\n{query}")
+            self.raw_df = (
+                bigquery.Client(project=self.project).query(query).to_dataframe()
+            )
+            df = self.raw_df.copy(deep=True)
+        else:
+            if filtered_end_date is not None:
+                self.historical_end_date = filtered_end_date
 
-        # ensure submission_date has type 'date'
-        # raw["submission_date"] = pd.to_datetime(raw["submission_date"]).dt.date
+            print(f"Truncating data to before:\n\n{self.historical_end_date}")
+            df = self.raw_df[
+                pd.to_datetime(self.raw_df.submission_date)
+                <= pd.to_datetime(self.historical_end_date)
+            ].copy(deep=True)
+
+        self.dates_to_predict = pd.DataFrame(
+            {
+                "submission_date": pd.date_range(
+                    self.historical_end_date, self.forecast_end_date
+                ).date[1:]
+            }
+        )
 
         cols = list(set(df.columns) - {"submission_date", "country", "dau"})
         df["population"] = (
